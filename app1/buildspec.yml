@@ -1,0 +1,85 @@
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    DOCKER_BUILDKIT: "1"
+  git-credential-helper: yes
+
+phases:
+  pre_build:
+    commands:
+      # AWS CLIのバージョン確認
+      # - aws --version
+
+      # Dockerのバージョン確認
+      # - docker version
+
+      # 変数の設定
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+      - ECR_REPOSITORY_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_NAME}
+      - COMMIT_HASH=$(echo ${CODEBUILD_RESOLVED_SOURCE_VERSION} | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+
+      # Docker Hubへのログイン
+      - echo ${DOCKERHUB_PASSWORD} | docker login --username ${DOCKERHUB_USERNAME} --password-stdin
+
+      # ECRへのログイン
+      - aws ecr get-login-password | docker login --username AWS --password-stdin https://${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+
+      # S3にgit tree hashがない場合は空のファイルを作成
+      - |
+        if aws s3 ls s3://${GIT_TREE_HASH_BUCKET}/${APP_NAME}-last-tree-hash.txt > /dev/null 2>&1; then
+          :
+        else
+          touch last-tree-hash.txt
+          aws s3 cp last-tree-hash.txt s3://${GIT_TREE_HASH_BUCKET}/${APP_NAME}-last-tree-hash.txt
+        fi
+
+      # S3から前回のgit tree hashを取得
+      - aws s3 cp s3://${GIT_TREE_HASH_BUCKET}/${APP_NAME}-last-tree-hash.txt last-tree-hash.txt
+      - LAST_TREE_HASH=$(cat last-tree-hash.txt)
+      - echo ${LAST_TREE_HASH}
+
+      # 現在のgit tree hashを取得
+      - git config --global init.defaultBranch main
+      - git config --global user.email "codebuild@example.com"
+      - git config --global user.name "codebuild_user"
+      - git init
+      - git add .
+      - git commit -m "init" > /dev/null
+      - CURRENT_TREE_HASH=$(git cat-file -p HEAD^{tree} | grep tree| grep ${APP_NAME} | cut -f 1 | cut -d " " -f 3)
+      - echo ${CURRENT_TREE_HASH}
+
+      # 比較
+      - |
+        if [ "${CURRENT_TREE_HASH}" == "${LAST_TREE_HASH}" ]; then
+          echo "No changes detected."
+        else
+          IS_BUILD=TRUE
+          echo "Changes detected."
+        fi
+
+  build:
+    on-failure: ABORT
+    commands:
+      - |
+        if [ "$IS_BUILD" == "TRUE" ]; then
+          echo "Building an image..."
+          cd ${APP_NAME}
+          docker build -t ${ECR_REPOSITORY_URI}:latest .
+          docker tag ${ECR_REPOSITORY_URI}:latest ${ECR_REPOSITORY_URI}:${IMAGE_TAG}
+          docker push ${ECR_REPOSITORY_URI}:latest
+          docker push ${ECR_REPOSITORY_URI}:${IMAGE_TAG}
+        fi
+  post_build:
+    on-failure: ABORT
+    commands:
+      - |
+        if [ "$IS_BUILD" == "TRUE" ]; then
+          if [ "$CODEBUILD_BUILD_SUCCEEDING" == "1" ]; then
+            echo "Updating git tree hash..."
+            echo ${CURRENT_TREE_HASH} > current-tree-hash.txt
+            aws s3 cp current-tree-hash.txt s3://${GIT_TREE_HASH_BUCKET}/${APP_NAME}-last-tree-hash.txt
+          fi
+        fi
